@@ -1,11 +1,12 @@
-"""RE:CORD 기능 구현: Python 표준 라이브러리 + JSON 파일 저장.
+"""RE:CORD 기능 구현: Firebase 또는 로컬 JSON 파일 저장.
 
 웹 화면(app.py)에서는 Streamlit만 사용한다. 이 파일은 파이썬만으로
 사용자·활동·체크리스트를 저장하고 검색·수정·복제한다.
 """
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import RLock, local
+from functools import wraps
 import hashlib
 import hmac
 import json
@@ -16,12 +17,63 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "record_data.json"
 BACKUP_DIR = BASE_DIR / "backups"
 _LOCK = RLock()
+_FIREBASE_CONTEXT = local()
+_FIREBASE_CLIENT = None
 CATEGORIES = ("동아리", "교내 행사", "학생회")
 TEMPLATES = {
     "동아리": ["활동 목표 정하기", "역할 나누기", "준비물 확인", "활동 진행", "결과·개선점 기록"],
     "교내 행사": ["일정과 장소 확인", "담당자와 역할 배정", "안내 자료 준비", "리허설 진행", "행사 후 피드백 정리"],
     "학생회": ["의견 수렴", "안건 선정", "실행 계획 수립", "학교와 협의", "결과 공지"],
 }
+
+
+def _firebase_client():
+    """설정이 있으면 Firebase를 연결하고, 없으면 기존 로컬 JSON을 사용한다."""
+    global _FIREBASE_CLIENT
+    try:
+        import streamlit as st
+    except ModuleNotFoundError:
+        return None
+    try:
+        section = st.secrets.get("firebase")
+    except (AttributeError, FileNotFoundError):
+        section = None
+    except Exception as exc:
+        if exc.__class__.__name__ == "StreamlitSecretNotFoundError":
+            section = None
+        else:
+            raise
+    if section is None:
+        return None
+    if _FIREBASE_CLIENT is None:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        account = json.loads(section["service_account_json"])
+        try:
+            app = firebase_admin.get_app("record_firebase")
+        except ValueError:
+            app = firebase_admin.initialize_app(credentials.Certificate(account), name="record_firebase")
+        _FIREBASE_CLIENT = firestore.client(app=app)
+    return _FIREBASE_CLIENT
+
+
+def _firebase_atomic(function):
+    """동시에 저장해도 데이터가 서로 덮이지 않도록 트랜잭션으로 처리한다."""
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        client = _firebase_client()
+        if client is None:
+            return function(*args, **kwargs)
+        from google.cloud import firestore
+        @firestore.transactional
+        def run(transaction):
+            _FIREBASE_CONTEXT.transaction = transaction
+            try:
+                return function(*args, **kwargs)
+            finally:
+                del _FIREBASE_CONTEXT.transaction
+        return run(client.transaction())
+    return wrapper
 
 
 def _empty_data():
@@ -35,11 +87,17 @@ def _empty_data():
 
 
 def _read_data():
-    """디스크의 JSON 자료를 읽어 파이썬 딕셔너리로 변환한다."""
-    if not DATA_PATH.exists():
-        return _empty_data()
-    with open(DATA_PATH, "r", encoding="utf-8") as file:
-        data = json.load(file)
+    """설정에 따라 Firebase 또는 디스크에서 자료를 읽는다."""
+    client = _firebase_client()
+    if client is not None:
+        transaction = getattr(_FIREBASE_CONTEXT, "transaction", None)
+        snapshot = client.collection("record_app").document("data").get(transaction=transaction)
+        data = json.loads(snapshot.to_dict()["json"]) if snapshot.exists else _empty_data()
+    else:
+        if not DATA_PATH.exists():
+            return _empty_data()
+        with open(DATA_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
     if not isinstance(data, dict) or not all(
         key in data for key in ("users", "activities", "checklist", "next_ids")
     ):
@@ -63,7 +121,17 @@ def _read_data():
 
 
 def _write_data(data):
-    """중간 저장 오류에 대비하여 임시 파일에 기록하고 교체한다."""
+    """Firebase에 원자적으로 저장하거나 로컬 임시 파일로 교체한다."""
+    client = _firebase_client()
+    if client is not None:
+        transaction = getattr(_FIREBASE_CONTEXT, "transaction", None)
+        if transaction is None:
+            raise RuntimeError("Firebase 저장에는 트랜잭션이 필요합니다.")
+        payload = json.dumps(data, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > 900_000:
+            raise ValueError("Firebase 저장 용량 한도에 가까워 추가 저장을 중단했습니다.")
+        transaction.set(client.collection("record_app").document("data"), {"json": payload})
+        return
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = DATA_PATH.with_name(DATA_PATH.name + "." + secrets.token_hex(6) + ".tmp")
     try:
@@ -78,6 +146,8 @@ def _write_data(data):
 def initialize_storage():
     """첫 실행에 빈 JSON 기록 파일을 만든다."""
     with _LOCK:
+        if _firebase_client() is not None:
+            return  # Firebase 문서는 첫 저장 때 생성합니다.
         if not DATA_PATH.exists():
             _write_data(_empty_data())
 
@@ -384,3 +454,11 @@ def add_task(activity_id, owner_id, task):
         })
         _write_data(data)
         return True
+
+# 저장하는 기능은 Firebase에서 동시 수정 충돌을 방지합니다.
+register_user = _firebase_atomic(register_user)
+add_activity = _firebase_atomic(add_activity)
+update_checklist = _firebase_atomic(update_checklist)
+update_visibility = _firebase_atomic(update_visibility)
+edit_activity = _firebase_atomic(edit_activity)
+add_task = _firebase_atomic(add_task)
